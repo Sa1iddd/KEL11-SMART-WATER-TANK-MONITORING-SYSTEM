@@ -20,5 +20,21 @@ Sistem ini memantau ketinggian air dalam tangki menggunakan sensor ultrasonik ya
 - Menghemat energi dan air
 - Solusi otomatisasi rumah yang hemat biaya dan praktis
 
+## Daftar Komponen
+- ESP32
+- Breadboard dan Kabel
+- Modul Relay
+- Sensor Ultrasonik HC-SR04
+- Pompa Mini Micro DC 3V - 6V
+
 ---
 
+```mermaid
+graph TD
+  Sensor_Ultrasonik --> ESP32
+  ESP32 --> WiFi
+  WiFi --> Cloud[Blynk/Firebase]
+  Cloud --> MobileApp[Mobile App]
+  MobileApp -->|Kontrol| Cloud
+  Cloud -->|Aktuasi| ESP32
+  ESP32 --> Relay --> Pompa
