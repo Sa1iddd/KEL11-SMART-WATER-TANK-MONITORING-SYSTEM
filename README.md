@@ -29,6 +29,7 @@ Sistem ini memantau ketinggian air dalam tangki menggunakan sensor ultrasonik ya
 
 ---
 
+## Skema Sistem
 ```mermaid
 graph TD
   Sensor_Ultrasonik --> ESP32
