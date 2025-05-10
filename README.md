@@ -1,7 +1,8 @@
-﻿# KELOMPOK 11
-# Muhammad Zacky Said, 105222046
-# Rayhan Surya Destian, 105222024
-# 💧 Smart Water Tank Monitoring System
+﻿# 💧 Smart Water Tank Monitoring System
+
+## KELOMPOK 11
+## Muhammad Zacky Said, 105222046
+## Rayhan Surya Destian, 105222024
 
 ## 🎯 SDG Fokus
 **SDG 6 – Clean Water and Sanitation**
