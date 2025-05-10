@@ -21,14 +21,3 @@ Sistem ini memantau ketinggian air dalam tangki menggunakan sensor ultrasonik ya
 
 ---
 
-## 🧱 Skema Blok Sistem
-
-```mermaid
-graph TD
-  Sensor_Ultrasonik --> ESP32
-  ESP32 --> WiFi
-  WiFi --> Cloud[Blynk/Firebase]
-  Cloud --> MobileApp[Mobile App]
-  MobileApp -->|Kontrol| Cloud
-  Cloud -->|Aktuasi| ESP32
-  ESP32 --> Relay --> Pompa
