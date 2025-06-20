@@ -2,8 +2,10 @@ const express = require('express');
 const router = express.Router();
 const db = require('../db');
 
-// Get tank height from environment variables, default to 100cm
+// Get configuration from environment variables, with defaults
 const TANK_HEIGHT_CM = parseInt(process.env.TANK_HEIGHT_CM || '100', 10);
+const REFRESH_INTERVAL_MS = parseInt(process.env.REFRESH_INTERVAL_MS || '5000', 10);
+const MAX_HISTORY_MINUTES_AGO = parseInt(process.env.MAX_HISTORY_MINUTES_AGO || '60', 10);
 
 // Middleware to validate ESP32 API key
 const validateApiKey = (req, res, next) => {
@@ -15,6 +17,66 @@ const validateApiKey = (req, res, next) => {
   }
   
   next();
+};
+
+// Helper function to check if temporary password has expired
+const isPasswordExpired = (expiresAt) => {
+  if (!expiresAt) return false; // Permanent password
+  return new Date() > new Date(expiresAt);
+};
+
+// Middleware to validate main admin password (for managing temporary passwords)
+const validateMainPassword = (req, res, next) => {
+  const password = req.body.password;
+  const validPassword = process.env.PUMP_CONTROL_PASSWORD;
+  
+  if (!password || password !== validPassword) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid main password' });
+  }
+  
+  next();
+};
+
+// Middleware to validate pump control password (main or temporary)
+const validatePumpPassword = async (req, res, next) => {
+  const password = req.body.password;
+  const mainPassword = process.env.PUMP_CONTROL_PASSWORD;
+  
+  if (!password) {
+    return res.status(401).json({ error: 'Unauthorized: Password required' });
+  }
+  
+  // Check main password first
+  if (password === mainPassword) {
+    req.isMainPassword = true;
+    return next();
+  }
+  
+  // Check temporary passwords
+  try {
+    const pool = db.getPool();
+    const [rows] = await pool.query(
+      'SELECT id, expires_at FROM temporary_passwords WHERE password = ?',
+      [password]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid password' });
+    }
+    
+    const tempPassword = rows[0];
+    if (isPasswordExpired(tempPassword.expires_at)) {
+      // Clean up expired password
+      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [tempPassword.id]);
+      return res.status(401).json({ error: 'Unauthorized: Password has expired' });
+    }
+    
+    req.isMainPassword = false;
+    next();
+  } catch (error) {
+    console.error('Error validating temporary password:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 };
 
 // Error handling middleware
@@ -81,7 +143,9 @@ router.get('/latest', asyncHandler(async (req, res) => {
       timestamp: new Date(),
       pump_on: false,
       auto_mode: true,
-      tank_height_cm: TANK_HEIGHT_CM
+      tank_height_cm: TANK_HEIGHT_CM,
+      refresh_interval_ms: REFRESH_INTERVAL_MS,
+      max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO
     });
   }
   
@@ -90,30 +154,96 @@ router.get('/latest', asyncHandler(async (req, res) => {
     timestamp: sensorRows[0].timestamp,
     pump_on: pumpRows[0].is_on,
     auto_mode: pumpRows[0].auto_mode,
-    tank_height_cm: TANK_HEIGHT_CM
+    tank_height_cm: TANK_HEIGHT_CM,
+    refresh_interval_ms: REFRESH_INTERVAL_MS,
+    max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO
   });
 }));
 
-// GET /api/history - Get historical sensor data
+// GET /api/history - Get historical sensor data with time-based filtering
 router.get('/history', asyncHandler(async (req, res) => {
   const pool = db.getPool();
-  const limit = parseInt(req.query.limit || '24', 10); // Default to last 24 entries
+  const minutesAgo = parseInt(req.query.minutes_ago || MAX_HISTORY_MINUTES_AGO.toString(), 10);
+  const maxDataPoints = parseInt(req.query.max_points || '100', 10);
   
-  // Get historical data with a reasonable limit
+  // Calculate cutoff time
+  const cutoffTime = new Date(Date.now() - minutesAgo * 60 * 1000);
+  
+  // Get historical data within time range
   const [rows] = await pool.query(
-    'SELECT level_cm, timestamp FROM sensor_data ORDER BY timestamp DESC LIMIT ?', 
-    [Math.min(limit, 100)] // Cap at 100 entries to prevent excessive data transfer
+    `SELECT level_cm, timestamp 
+     FROM sensor_data 
+     WHERE timestamp >= ? 
+     ORDER BY timestamp DESC 
+     LIMIT ?`, 
+    [cutoffTime, Math.min(maxDataPoints, 200)] // Cap at 200 entries
   );
   
-  // Return data in chronological order (oldest first)
+  // For dense data, reduce points to improve performance
+  let processedData = rows.reverse(); // Chronological order
+  
+  if (processedData.length > maxDataPoints) {
+    // Simple data reduction: take every nth point to reach target count
+    const step = Math.ceil(processedData.length / maxDataPoints);
+    processedData = processedData.filter((_, index) => index % step === 0);
+    
+    // Always include the last data point
+    if (processedData[processedData.length - 1] !== rows[0]) {
+      processedData.push(rows[0]);
+    }
+  }
+  
   res.json({
-    history: rows.reverse(),
-    tank_height_cm: TANK_HEIGHT_CM
+    history: processedData,
+    tank_height_cm: TANK_HEIGHT_CM,
+    max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO,
+    refresh_interval_ms: REFRESH_INTERVAL_MS,
+    total_points: rows.length,
+    filtered_points: processedData.length,
+    time_range_minutes: minutesAgo
   });
+}));
+
+// POST /api/validate-password - Validate pump control password
+router.post('/validate-password', asyncHandler(async (req, res) => {
+  const { password } = req.body;
+  const mainPassword = process.env.PUMP_CONTROL_PASSWORD;
+  
+  if (password === mainPassword) {
+    res.json({ success: true, valid: true, isMainPassword: true });
+    return;
+  }
+  
+  // Check temporary passwords
+  try {
+    const pool = db.getPool();
+    const [rows] = await pool.query(
+      'SELECT id, expires_at FROM temporary_passwords WHERE password = ?',
+      [password]
+    );
+    
+    if (rows.length === 0) {
+      res.json({ success: true, valid: false });
+      return;
+    }
+    
+    const tempPassword = rows[0];
+    if (isPasswordExpired(tempPassword.expires_at)) {
+      // Clean up expired password
+      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [tempPassword.id]);
+      res.json({ success: true, valid: false });
+      return;
+    }
+    
+    res.json({ success: true, valid: true, isMainPassword: false });
+  } catch (error) {
+    console.error('Error validating temporary password:', error);
+    res.json({ success: true, valid: false });
+  }
 }));
 
 // POST /api/pump - Update pump status manually
-router.post('/pump', asyncHandler(async (req, res) => {
+router.post('/pump', validatePumpPassword, asyncHandler(async (req, res) => {
   const { is_on } = req.body;
   
   if (is_on === undefined || typeof is_on !== 'boolean') {
@@ -127,7 +257,7 @@ router.post('/pump', asyncHandler(async (req, res) => {
 }));
 
 // POST /api/auto - Toggle auto mode
-router.post('/auto', asyncHandler(async (req, res) => {
+router.post('/auto', validatePumpPassword, asyncHandler(async (req, res) => {
   const { auto_mode } = req.body;
   
   if (auto_mode === undefined || typeof auto_mode !== 'boolean') {
@@ -143,8 +273,101 @@ router.post('/auto', asyncHandler(async (req, res) => {
 // GET /api/config - Get configuration values
 router.get('/config', (req, res) => {
   res.json({
-    tank_height_cm: TANK_HEIGHT_CM
+    tank_height_cm: TANK_HEIGHT_CM,
+    refresh_interval_ms: REFRESH_INTERVAL_MS
   });
 });
+
+// Temporary Password Management Routes (requires main password)
+
+// GET /api/temp-passwords - Get all temporary passwords
+router.get('/temp-passwords', validateMainPassword, asyncHandler(async (req, res) => {
+  const pool = db.getPool();
+  const [rows] = await pool.query(
+    'SELECT id, password, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
+  );
+  
+  // Clean up expired passwords
+  const now = new Date();
+  const expiredIds = rows.filter(row => isPasswordExpired(row.expires_at)).map(row => row.id);
+  if (expiredIds.length > 0) {
+    await pool.query('DELETE FROM temporary_passwords WHERE id IN (?)', [expiredIds]);
+  }
+  
+  // Return non-expired passwords
+  const validPasswords = rows.filter(row => !isPasswordExpired(row.expires_at));
+  res.json({ success: true, passwords: validPasswords });
+}));
+
+// POST /api/temp-passwords/list - Get all temporary passwords (alternative endpoint for frontend)
+router.post('/temp-passwords/list', validateMainPassword, asyncHandler(async (req, res) => {
+  const pool = db.getPool();
+  const [rows] = await pool.query(
+    'SELECT id, password, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
+  );
+  
+  // Clean up expired passwords
+  const now = new Date();
+  const expiredIds = rows.filter(row => isPasswordExpired(row.expires_at)).map(row => row.id);
+  if (expiredIds.length > 0) {
+    await pool.query('DELETE FROM temporary_passwords WHERE id IN (?)', [expiredIds]);
+  }
+  
+  // Return non-expired passwords
+  const validPasswords = rows.filter(row => !isPasswordExpired(row.expires_at));
+  res.json({ success: true, passwords: validPasswords });
+}));
+
+// POST /api/temp-passwords - Create new temporary password
+router.post('/temp-passwords', validateMainPassword, asyncHandler(async (req, res) => {
+  const { newPassword, expirationMinutes } = req.body;
+  const password = newPassword;
+  
+  if (!password || password.trim().length < 3) {
+    return res.status(400).json({ error: 'Password must be at least 3 characters long' });
+  }
+  
+  if (password === process.env.PUMP_CONTROL_PASSWORD) {
+    return res.status(400).json({ error: 'Temporary password cannot be the same as main password' });
+  }
+  
+  let expiresAt = null;
+  if (expirationMinutes && expirationMinutes > 0) {
+    expiresAt = new Date(Date.now() + expirationMinutes * 60 * 1000);
+  }
+  
+  const pool = db.getPool();
+  
+  // Check if password already exists
+  const [existing] = await pool.query('SELECT id FROM temporary_passwords WHERE password = ?', [password]);
+  if (existing.length > 0) {
+    return res.status(400).json({ error: 'This password already exists' });
+  }
+  
+  await pool.query(
+    'INSERT INTO temporary_passwords (password, expires_at) VALUES (?, ?)',
+    [password, expiresAt]
+  );
+  
+  res.json({ success: true, message: 'Temporary password created successfully' });
+}));
+
+// DELETE /api/temp-passwords/:id - Delete temporary password
+router.delete('/temp-passwords/:id', validateMainPassword, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  
+  if (!id || isNaN(id)) {
+    return res.status(400).json({ error: 'Invalid password ID' });
+  }
+  
+  const pool = db.getPool();
+  const [result] = await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [parseInt(id)]);
+  
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Password not found' });
+  }
+  
+  res.json({ success: true, message: 'Temporary password deleted successfully' });
+}));
 
 module.exports = router; 

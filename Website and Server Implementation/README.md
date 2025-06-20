@@ -2,8 +2,6 @@
 
 A simple IoT monitoring website for a Smart Water Tank based on Node.js, React, and MySQL.
 
-A more up-to-date version might be available here: https://github.com/rayhandestian/IoT_Water_Tank_Website
-
 ## Features
 
 - Real-time water level monitoring
@@ -55,6 +53,24 @@ A more up-to-date version might be available here: https://github.com/rayhandest
 
 2. Access the dashboard:
    - Open your browser and navigate to `http://localhost:3000`
+
+## Timezone Configuration
+
+By default, the application uses the system's local timezone. To configure a specific timezone (e.g., for containerized deployments), you can set the `TZ` environment variable in your startup command.
+
+### Example with Asia/Jakarta timezone:
+```bash
+if [[ -d .git ]] && [[ 0 == "1" ]]; then git pull; fi; if [[ ! -z ${NODE_PACKAGES} ]]; then /usr/local/bin/npm install ${NODE_PACKAGES}; fi; if [[ ! -z ${UNNODE_PACKAGES} ]]; then /usr/local/bin/npm uninstall ${UNNODE_PACKAGES}; fi; if [ -f /home/container/package.json ]; then /usr/local/bin/npm install; fi; export TZ=Asia/Jakarta; if [[ "${MAIN_FILE}" == "*.js" ]]; then /usr/local/bin/node "/home/container/${MAIN_FILE}" ${NODE_ARGS}; else /usr/local/bin/ts-node --esm "/home/container/${MAIN_FILE}" ${NODE_ARGS}; fi
+```
+
+### Common timezone values:
+- `UTC` (Coordinated Universal Time)
+- `Asia/Jakarta` (Western Indonesia Time)
+- `America/New_York` (Eastern Time)
+- `Europe/London` (Greenwich Mean Time)
+- `Asia/Tokyo` (Japan Standard Time)
+
+**Note:** This affects server-side timestamps. Frontend timestamps will still display in the user's browser timezone.
 
 ## API Endpoints
 
