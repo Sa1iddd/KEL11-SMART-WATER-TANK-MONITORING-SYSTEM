@@ -11,6 +11,7 @@ import {
   Legend
 } from 'chart.js';
 import axios from 'axios';
+import { decryptWaterLevel } from '../utils/crypto';
 
 // Register ChartJS components
 ChartJS.register(
@@ -57,13 +58,21 @@ const useIsMobile = () => {
   return isMobile;
 };
 
-const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshIntervalMs = 5000 }) => {
+const WaterLevelChart = ({ 
+  tankHeight, 
+  maxHistoryMinutesAgo = 60, 
+  refreshIntervalMs = 5000,
+  encryptedMode = false,
+  decryptionKey = '',
+  selectedAlgorithm = 'AUTO'
+}) => {
   const [historyData, setHistoryData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
   const [lastFetchTime, setLastFetchTime] = useState(null);
   const [dataStats, setDataStats] = useState({});
+  const [decryptedData, setDecryptedData] = useState([]);
   
   // Mobile detection
   const isMobile = useIsMobile();
@@ -94,6 +103,33 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
     return gradient;
   }, []);
 
+  // Use crypto utilities for consistent decryption
+  const performDecryption = useCallback((encryptedHex, key, algorithm = 'AUTO') => {
+    const result = decryptWaterLevel(encryptedHex, key, algorithm);
+    return result.success ? result.value : null;
+  }, []);
+
+  // Process encrypted data when key changes
+  useEffect(() => {
+    if (encryptedMode && decryptionKey && historyData.length > 0) {
+      const processed = historyData.map(item => {
+        if (item.encrypted_level) {
+          const decrypted = performDecryption(item.encrypted_level, decryptionKey, selectedAlgorithm);
+          return {
+            ...item,
+            level_cm: decrypted,
+            decryption_success: decrypted !== null
+          };
+        }
+        return { ...item, decryption_success: false };
+      }).filter(item => item.decryption_success);
+      
+      setDecryptedData(processed);
+    } else {
+      setDecryptedData([]);
+    }
+  }, [historyData, encryptedMode, decryptionKey, selectedAlgorithm, performDecryption]);
+
   // Fetch history data with error recovery
   const fetchHistoryData = useCallback(async (isRetry = false) => {
     try {
@@ -112,7 +148,8 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
       const response = await axios.get('/api/history', {
         params: {
           minutes_ago: maxHistoryMinutesAgo,
-          max_points: isMobile ? 30 : 50 // Reduce data points on mobile for better performance
+          max_points: isMobile ? 30 : 50, // Reduce data points on mobile for better performance
+          encrypted: encryptedMode
         },
         signal: abortControllerRef.current.signal
       });
@@ -152,7 +189,7 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
     } finally {
       setLoading(false);
     }
-  }, [maxHistoryMinutesAgo, retryCount, isMobile]);
+  }, [maxHistoryMinutesAgo, retryCount, isMobile, encryptedMode]);
 
   // Manual retry function
   const handleRetry = useCallback(() => {
@@ -226,31 +263,33 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
 
   // Memoized chart data
   const chartData = useMemo(() => {
-    if (!historyData.length) return null;
+    const dataToUse = encryptedMode ? decryptedData : historyData;
+    
+    if (!dataToUse.length) return null;
 
     return {
-      labels: historyData.map(item => formatTimestamp(item.timestamp)),
+      labels: dataToUse.map(item => formatTimestamp(item.timestamp)),
       datasets: [
         {
-          label: 'Water Level (cm)',
-          data: historyData.map(item => item.level_cm),
+          label: `Water Level (cm)${encryptedMode ? ' - Decrypted' : ''}`,
+          data: dataToUse.map(item => item.level_cm),
           fill: true,
           backgroundColor: createGradient,
-          borderColor: '#2563eb',
+          borderColor: encryptedMode ? '#8b5cf6' : '#2563eb',
           borderWidth: isMobile ? 2 : 3,
           tension: 0.4,
           pointRadius: isMobile ? 2 : 3,
           pointHoverRadius: isMobile ? 4 : 6,
           pointBackgroundColor: '#ffffff',
-          pointBorderColor: '#2563eb',
+          pointBorderColor: encryptedMode ? '#8b5cf6' : '#2563eb',
           pointBorderWidth: isMobile ? 1 : 2,
-          pointHoverBackgroundColor: '#2563eb',
+          pointHoverBackgroundColor: encryptedMode ? '#8b5cf6' : '#2563eb',
           pointHoverBorderColor: '#ffffff',
           pointHoverBorderWidth: isMobile ? 2 : 3,
         }
       ]
     };
-  }, [historyData, formatTimestamp, createGradient, isMobile]);
+  }, [historyData, decryptedData, encryptedMode, formatTimestamp, createGradient, isMobile]);
 
   // Memoized chart options with mobile responsiveness
   const chartOptions = useMemo(() => ({
@@ -356,8 +395,9 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
         callbacks: {
           title: function(context) {
             const dataIndex = context[0].dataIndex;
-            const originalTimestamp = historyData[dataIndex].timestamp;
-            return formatTooltipTimestamp(originalTimestamp);
+            const dataToUse = encryptedMode ? decryptedData : historyData;
+            const originalTimestamp = dataToUse[dataIndex]?.timestamp;
+            return originalTimestamp ? formatTooltipTimestamp(originalTimestamp) : '';
           },
           label: function(context) {
             const label = context.dataset.label || '';
@@ -377,7 +417,7 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
     },
     // Mobile-specific optimizations
     devicePixelRatio: isMobile ? 1 : undefined, // Reduce pixel ratio on mobile for better performance
-  }), [tankHeight, maxHistoryMinutesAgo, historyData, formatTooltipTimestamp, isMobile]);
+  }), [tankHeight, maxHistoryMinutesAgo, historyData, decryptedData, encryptedMode, formatTooltipTimestamp, isMobile]);
 
   // Render loading state
   if (loading && !historyData.length) {
@@ -423,17 +463,36 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
     );
   }
 
+  // Encrypted mode specific empty state
+  if (encryptedMode && (!decryptionKey || decryptedData.length === 0)) {
+    return (
+      <div className="chart-container">
+        <div className="chart-empty">
+          <span className="empty-icon">🔐</span>
+          <span>
+            {!decryptionKey 
+              ? 'Enter decryption key to view encrypted data' 
+              : 'No valid decrypted data available'
+            }
+          </span>
+          <button onClick={handleRetry} className="retry-button">
+            Refresh Data
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="chart-container">
       {/* Chart status bar */}
       <div className="chart-status-bar">
         <div className="chart-info">
           <span className="data-points">
-            {dataStats.filteredPoints || historyData.length} data points
-            {dataStats.totalPoints && dataStats.totalPoints > dataStats.filteredPoints && (
-              <span className="reduced-notice">
-                {isMobile ? `(${dataStats.totalPoints} total)` : `(reduced from ${dataStats.totalPoints})`}
-              </span>
+            {encryptedMode ? (
+              `${decryptedData.length} decrypted points${dataStats.totalPoints ? ` (${dataStats.totalPoints} encrypted)` : ''}`
+            ) : (
+              `${dataStats.filteredPoints || historyData.length} data points${dataStats.totalPoints && dataStats.totalPoints > dataStats.filteredPoints ? ` (reduced from ${dataStats.totalPoints})` : ''}`
             )}
           </span>
           {lastFetchTime && (
@@ -442,6 +501,11 @@ const WaterLevelChart = ({ tankHeight, maxHistoryMinutesAgo = 60, refreshInterva
                 hour: '2-digit',
                 minute: '2-digit'
               })}
+            </span>
+          )}
+          {encryptedMode && (
+            <span className="encryption-status">
+              🔐 {decryptionKey ? 'Encrypted Mode - Key Active' : 'Encrypted Mode - No Key'}
             </span>
           )}
         </div>
