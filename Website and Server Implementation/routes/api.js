@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const bcrypt = require('bcrypt');
 
 // Get configuration from environment variables, with defaults
 const TANK_HEIGHT_CM = parseInt(process.env.TANK_HEIGHT_CM || '100', 10);
@@ -26,48 +27,79 @@ const isPasswordExpired = (expiresAt) => {
 };
 
 // Middleware to validate main admin password (for managing temporary passwords)
-const validateMainPassword = (req, res, next) => {
+const validateMainPassword = async (req, res, next) => {
   const password = req.body.password;
-  const validPassword = process.env.PUMP_CONTROL_PASSWORD;
+  const validPasswordHash = process.env.PUMP_CONTROL_PASSWORD;
   
-  if (!password || password !== validPassword) {
+  if (!password) {
     return res.status(401).json({ error: 'Unauthorized: Invalid main password' });
   }
   
-  next();
+  try {
+    const isValid = await bcrypt.compare(password, validPasswordHash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid main password' });
+    }
+    
+    next();
+  } catch (error) {
+    console.error('Error validating main password:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 };
 
 // Middleware to validate pump control password (main or temporary)
 const validatePumpPassword = async (req, res, next) => {
   const password = req.body.password;
-  const mainPassword = process.env.PUMP_CONTROL_PASSWORD;
+  const mainPasswordHash = process.env.PUMP_CONTROL_PASSWORD;
   
   if (!password) {
     return res.status(401).json({ error: 'Unauthorized: Password required' });
   }
   
   // Check main password first
-  if (password === mainPassword) {
-    req.isMainPassword = true;
-    return next();
+  try {
+    const isMainPassword = await bcrypt.compare(password, mainPasswordHash);
+    if (isMainPassword) {
+      req.isMainPassword = true;
+      return next();
+    }
+  } catch (error) {
+    console.error('Error validating main password:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
   
   // Check temporary passwords
   try {
     const pool = db.getPool();
     const [rows] = await pool.query(
-      'SELECT id, expires_at FROM temporary_passwords WHERE password = ?',
-      [password]
+      'SELECT id, password, expires_at FROM temporary_passwords',
+      []
     );
     
-    if (rows.length === 0) {
+    let validTempPassword = null;
+    
+    // Check each temporary password with bcrypt
+    for (const row of rows) {
+      try {
+        const isValid = await bcrypt.compare(password, row.password);
+        if (isValid) {
+          validTempPassword = row;
+          break;
+        }
+      } catch (compareError) {
+        console.error('Error comparing temporary password:', compareError);
+        continue;
+      }
+    }
+    
+    if (!validTempPassword) {
       return res.status(401).json({ error: 'Unauthorized: Invalid password' });
     }
     
-    const tempPassword = rows[0];
-    if (isPasswordExpired(tempPassword.expires_at)) {
+    if (isPasswordExpired(validTempPassword.expires_at)) {
       // Clean up expired password
-      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [tempPassword.id]);
+      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [validTempPassword.id]);
       return res.status(401).json({ error: 'Unauthorized: Password has expired' });
     }
     
@@ -114,6 +146,28 @@ router.post('/data', validateApiKey, asyncHandler(async (req, res) => {
   });
 }));
 
+// POST /api/encrypted-data - Receive encrypted sensor data from ESP32
+router.post('/encrypted-data', validateApiKey, asyncHandler(async (req, res) => {
+  const { encrypted_level } = req.body;
+  
+  if (!encrypted_level || typeof encrypted_level !== 'string') {
+    return res.status(400).json({ error: 'Invalid data: encrypted_level is required and must be a string' });
+  }
+  
+  // Insert encrypted sensor data
+  const pool = db.getPool();
+  await pool.query('INSERT INTO encrypted_sensor_data (encrypted_level) VALUES (?)', [encrypted_level]);
+  
+  // Get current pump status
+  const [rows] = await pool.query('SELECT is_on, auto_mode FROM pump_status ORDER BY id DESC LIMIT 1');
+  const { is_on, auto_mode } = rows[0];
+  
+  res.json({
+    pump_on: is_on,
+    auto_mode: auto_mode
+  });
+}));
+
 // GET /api/status - ESP32 polling for pump status
 router.get('/status', validateApiKey, asyncHandler(async (req, res) => {
   const pool = db.getPool();
@@ -129,9 +183,16 @@ router.get('/status', validateApiKey, asyncHandler(async (req, res) => {
 // GET /api/latest - Get latest sensor data and pump status
 router.get('/latest', asyncHandler(async (req, res) => {
   const pool = db.getPool();
+  const encrypted = req.query.encrypted === 'true';
   
-  // Get latest sensor data
-  const [sensorRows] = await pool.query('SELECT level_cm, timestamp FROM sensor_data ORDER BY id DESC LIMIT 1');
+  let sensorRows;
+  if (encrypted) {
+    // Get latest encrypted sensor data
+    [sensorRows] = await pool.query('SELECT encrypted_level, timestamp FROM encrypted_sensor_data ORDER BY id DESC LIMIT 1');
+  } else {
+    // Get latest regular sensor data
+    [sensorRows] = await pool.query('SELECT level_cm, timestamp FROM sensor_data ORDER BY id DESC LIMIT 1');
+  }
   
   // Get latest pump status
   const [pumpRows] = await pool.query('SELECT is_on, auto_mode FROM pump_status ORDER BY id DESC LIMIT 1');
@@ -139,25 +200,37 @@ router.get('/latest', asyncHandler(async (req, res) => {
   // If no data yet, return default values
   if (sensorRows.length === 0) {
     return res.json({
-      level_cm: 0,
+      level_cm: encrypted ? null : 0,
+      encrypted_level: encrypted ? "0000000000" : null,
       timestamp: new Date(),
       pump_on: false,
       auto_mode: true,
       tank_height_cm: TANK_HEIGHT_CM,
       refresh_interval_ms: REFRESH_INTERVAL_MS,
-      max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO
+      max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO,
+      encrypted_mode: encrypted
     });
   }
   
-  res.json({
-    level_cm: sensorRows[0].level_cm,
+  const response = {
     timestamp: sensorRows[0].timestamp,
     pump_on: pumpRows[0].is_on,
     auto_mode: pumpRows[0].auto_mode,
     tank_height_cm: TANK_HEIGHT_CM,
     refresh_interval_ms: REFRESH_INTERVAL_MS,
-    max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO
-  });
+    max_history_minutes_ago: MAX_HISTORY_MINUTES_AGO,
+    encrypted_mode: encrypted
+  };
+  
+  if (encrypted) {
+    response.encrypted_level = sensorRows[0].encrypted_level;
+    response.level_cm = null;
+  } else {
+    response.level_cm = sensorRows[0].level_cm;
+    response.encrypted_level = null;
+  }
+  
+  res.json(response);
 }));
 
 // GET /api/history - Get historical sensor data with time-based filtering
@@ -165,19 +238,33 @@ router.get('/history', asyncHandler(async (req, res) => {
   const pool = db.getPool();
   const minutesAgo = parseInt(req.query.minutes_ago || MAX_HISTORY_MINUTES_AGO.toString(), 10);
   const maxDataPoints = parseInt(req.query.max_points || '100', 10);
+  const encrypted = req.query.encrypted === 'true';
   
   // Calculate cutoff time
   const cutoffTime = new Date(Date.now() - minutesAgo * 60 * 1000);
   
-  // Get historical data within time range
-  const [rows] = await pool.query(
-    `SELECT level_cm, timestamp 
-     FROM sensor_data 
-     WHERE timestamp >= ? 
-     ORDER BY timestamp DESC 
-     LIMIT ?`, 
-    [cutoffTime, Math.min(maxDataPoints, 200)] // Cap at 200 entries
-  );
+  let rows;
+  if (encrypted) {
+    // Get encrypted historical data within time range
+    [rows] = await pool.query(
+      `SELECT encrypted_level, timestamp 
+       FROM encrypted_sensor_data 
+       WHERE timestamp >= ? 
+       ORDER BY timestamp DESC 
+       LIMIT ?`, 
+      [cutoffTime, Math.min(maxDataPoints, 200)] // Cap at 200 entries
+    );
+  } else {
+    // Get regular historical data within time range
+    [rows] = await pool.query(
+      `SELECT level_cm, timestamp 
+       FROM sensor_data 
+       WHERE timestamp >= ? 
+       ORDER BY timestamp DESC 
+       LIMIT ?`, 
+      [cutoffTime, Math.min(maxDataPoints, 200)] // Cap at 200 entries
+    );
+  }
   
   // For dense data, reduce points to improve performance
   let processedData = rows.reverse(); // Chronological order
@@ -200,17 +287,26 @@ router.get('/history', asyncHandler(async (req, res) => {
     refresh_interval_ms: REFRESH_INTERVAL_MS,
     total_points: rows.length,
     filtered_points: processedData.length,
-    time_range_minutes: minutesAgo
+    time_range_minutes: minutesAgo,
+    encrypted_mode: encrypted
   });
 }));
 
 // POST /api/validate-password - Validate pump control password
 router.post('/validate-password', asyncHandler(async (req, res) => {
   const { password } = req.body;
-  const mainPassword = process.env.PUMP_CONTROL_PASSWORD;
+  const mainPasswordHash = process.env.PUMP_CONTROL_PASSWORD;
   
-  if (password === mainPassword) {
-    res.json({ success: true, valid: true, isMainPassword: true });
+  // Check main password first
+  try {
+    const isMainPassword = await bcrypt.compare(password, mainPasswordHash);
+    if (isMainPassword) {
+      res.json({ success: true, valid: true, isMainPassword: true });
+      return;
+    }
+  } catch (error) {
+    console.error('Error validating main password:', error);
+    res.json({ success: true, valid: false });
     return;
   }
   
@@ -218,19 +314,34 @@ router.post('/validate-password', asyncHandler(async (req, res) => {
   try {
     const pool = db.getPool();
     const [rows] = await pool.query(
-      'SELECT id, expires_at FROM temporary_passwords WHERE password = ?',
-      [password]
+      'SELECT id, password, expires_at FROM temporary_passwords',
+      []
     );
     
-    if (rows.length === 0) {
+    let validTempPassword = null;
+    
+    // Check each temporary password with bcrypt
+    for (const row of rows) {
+      try {
+        const isValid = await bcrypt.compare(password, row.password);
+        if (isValid) {
+          validTempPassword = row;
+          break;
+        }
+      } catch (compareError) {
+        console.error('Error comparing temporary password:', compareError);
+        continue;
+      }
+    }
+    
+    if (!validTempPassword) {
       res.json({ success: true, valid: false });
       return;
     }
     
-    const tempPassword = rows[0];
-    if (isPasswordExpired(tempPassword.expires_at)) {
+    if (isPasswordExpired(validTempPassword.expires_at)) {
       // Clean up expired password
-      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [tempPassword.id]);
+      await pool.query('DELETE FROM temporary_passwords WHERE id = ?', [validTempPassword.id]);
       res.json({ success: true, valid: false });
       return;
     }
@@ -284,7 +395,7 @@ router.get('/config', (req, res) => {
 router.get('/temp-passwords', validateMainPassword, asyncHandler(async (req, res) => {
   const pool = db.getPool();
   const [rows] = await pool.query(
-    'SELECT id, password, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
+    'SELECT id, nickname, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
   );
   
   // Clean up expired passwords
@@ -303,7 +414,7 @@ router.get('/temp-passwords', validateMainPassword, asyncHandler(async (req, res
 router.post('/temp-passwords/list', validateMainPassword, asyncHandler(async (req, res) => {
   const pool = db.getPool();
   const [rows] = await pool.query(
-    'SELECT id, password, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
+    'SELECT id, nickname, expires_at, created_at, created_by FROM temporary_passwords ORDER BY created_at DESC'
   );
   
   // Clean up expired passwords
@@ -320,15 +431,30 @@ router.post('/temp-passwords/list', validateMainPassword, asyncHandler(async (re
 
 // POST /api/temp-passwords - Create new temporary password
 router.post('/temp-passwords', validateMainPassword, asyncHandler(async (req, res) => {
-  const { newPassword, expirationMinutes } = req.body;
+  const { newPassword, nickname, expirationMinutes } = req.body;
   const password = newPassword;
   
   if (!password || password.trim().length < 3) {
     return res.status(400).json({ error: 'Password must be at least 3 characters long' });
   }
   
-  if (password === process.env.PUMP_CONTROL_PASSWORD) {
-    return res.status(400).json({ error: 'Temporary password cannot be the same as main password' });
+  if (!nickname || nickname.trim().length === 0) {
+    return res.status(400).json({ error: 'Nickname is required' });
+  }
+  
+  if (nickname.trim().length > 100) {
+    return res.status(400).json({ error: 'Nickname must be 100 characters or less' });
+  }
+  
+  // Check if new password matches main password
+  try {
+    const isMainPassword = await bcrypt.compare(password, process.env.PUMP_CONTROL_PASSWORD);
+    if (isMainPassword) {
+      return res.status(400).json({ error: 'Temporary password cannot be the same as main password' });
+    }
+  } catch (error) {
+    console.error('Error checking password against main password:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
   
   let expiresAt = null;
@@ -338,15 +464,18 @@ router.post('/temp-passwords', validateMainPassword, asyncHandler(async (req, re
   
   const pool = db.getPool();
   
-  // Check if password already exists
-  const [existing] = await pool.query('SELECT id FROM temporary_passwords WHERE password = ?', [password]);
-  if (existing.length > 0) {
-    return res.status(400).json({ error: 'This password already exists' });
+  // Check if nickname already exists
+  const [existingNickname] = await pool.query('SELECT id FROM temporary_passwords WHERE nickname = ?', [nickname.trim()]);
+  if (existingNickname.length > 0) {
+    return res.status(400).json({ error: 'This nickname already exists. Please choose a different one.' });
   }
   
+  // Hash the password
+  const hashedPassword = await bcrypt.hash(password.trim(), 12);
+  
   await pool.query(
-    'INSERT INTO temporary_passwords (password, expires_at) VALUES (?, ?)',
-    [password, expiresAt]
+    'INSERT INTO temporary_passwords (password, nickname, expires_at) VALUES (?, ?, ?)',
+    [hashedPassword, nickname.trim(), expiresAt]
   );
   
   res.json({ success: true, message: 'Temporary password created successfully' });
